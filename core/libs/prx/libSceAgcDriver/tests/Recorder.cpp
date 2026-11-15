@@ -16627,6 +16627,151 @@ void smallElementDetileTests(Device& device) {
     std::cout << "small element detile tests passed\n";
 }
 
+bool writtenUploadCacheTests(Device& device) {
+#ifdef _WIN32
+    if (!AgcDriver::GuestMemory::WriteWatched()) return false;
+    constexpr std::size_t bytes = 1 << 20;
+    constexpr std::size_t page = 4096;
+    auto* memory = static_cast<std::uint8_t*>(GuestArena::GuestArenaAllocate_nid_postfix(bytes, 65536));
+    if (memory == nullptr) return false;
+    GuestArena::GuestArenaCommit_nid_postfix(memory, bytes, PAGE_READWRITE, bytes);
+    struct WatchCleanup {
+        std::uint8_t* memory;
+        std::size_t size;
+        ~WatchCleanup() {
+            GuestArena::GuestArenaReset_nid_postfix(memory, size);
+            GuestArena::GuestArenaRelease_nid_postfix(memory, size);
+        }
+    } watchCleanup{memory, bytes};
+    std::memset(memory, 0x37, bytes);
+    const auto address = reinterpret_cast<std::uint64_t>(memory);
+    auto context = device.GetContext();
+    context.hostImportAlignment = 0;
+    const auto before = GuestBufferMemory::WrittenUploadCounters();
+    VkBuffer cached = VK_NULL_HANDLE;
+    {
+        std::unique_lock gpu(GpuMutex());
+        Recorder recorder(context);
+        recorder.Activate();
+        {
+            GuestBufferMemory build(context);
+            build.AddWritable(address, bytes);
+            build.Upload(false);
+            std::uint32_t adjustment = 0;
+            const auto descriptor = build.Descriptor(address, bytes, adjustment);
+            cached = descriptor.buffer;
+            Require(cached != VK_NULL_HANDLE && descriptor.offset == 0 && adjustment == 0, "the written upload bound no buffer");
+            build.WriteBack();
+        }
+        auto scratch = std::make_shared<Buffer>(context, 65536, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        {
+            const auto commands = recorder.Commands();
+            const auto fill = context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer");
+            fill(commands, scratch->Handle(), 0, 65536, 0x37003700u);
+            recorder.Keep(scratch);
+        }
+        recorder.Submit();
+        device.WaitQueue();
+        recorder.Sync();
+        auto counters = GuestBufferMemory::WrittenUploadCounters();
+        Require(counters[0] == before[0] + 1, "the first written upload did not cache its buffer");
+        memory[2 * page] = 0x99;
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+        auto oldView = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        auto newView = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        {
+            const auto commands = recorder.Commands();
+            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+            CopyBuffer(context, commands, cached, 0, oldView->Handle(), 0, bytes);
+            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+            {
+                GuestBufferMemory refresh(context);
+                refresh.AddWritable(address, bytes);
+                refresh.Upload(false);
+                std::uint32_t adjustment = 0;
+                const auto descriptor = refresh.Descriptor(address, bytes, adjustment);
+                Require(descriptor.buffer == cached, "the refresh did not reuse the cached buffer");
+                CopyBuffer(context, commands, cached, 0, newView->Handle(), 0, bytes);
+                RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT | VK_ACCESS_SHADER_READ_BIT);
+                recorder.Keep(oldView);
+                recorder.Keep(newView);
+                recorder.Submit();
+                device.WaitQueue();
+                recorder.Sync();
+                refresh.WriteBack();
+            }
+        }
+        counters = GuestBufferMemory::WrittenUploadCounters();
+        Require(counters[2] == before[2] + 1, "the second written upload took the full path instead of the delta refresh");
+        Require(counters[4] == before[4] + 1, "the refresh rewrote more than the dirtied block");
+        oldView->Invalidate();
+        newView->Invalidate();
+        const auto oldBytes = oldView->Bytes();
+        const auto newBytes = newView->Bytes();
+        Require(std::all_of(oldBytes.begin(), oldBytes.end(), [](std::byte value) { return value == std::byte{0x37}; }), "a use recorded before the refresh saw its bytes (WAR)");
+        Require(newBytes[2 * page] == std::byte{0x99} && newBytes[2 * page + page] == std::byte{0x37}, "the refreshed buffer lost the guest store");
+        Require(memory[2 * page] == static_cast<std::uint8_t>(0x99), "the refresh's write-back rolled back the guest store");
+        memory[3 * page] = 0x55;
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+        {
+            const auto commands = recorder.Commands();
+            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+            const auto fill = context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer");
+            fill(commands, cached, 5 * 65536, 65536, 0x77777777);
+            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+            {
+                GuestBufferMemory again(context);
+                again.AddWritable(address, bytes);
+                again.Upload(false);
+                recorder.Submit();
+                device.WaitQueue();
+                recorder.Sync();
+                again.WriteBack();
+            }
+        }
+        Require(memory[5 * 65536] == 0x77, "the write-back dropped the block the GPU wrote into the cached buffer");
+        Require(memory[3 * page] == 0x55, "the write-back rolled a CPU store back to the refresh baseline");
+        Require(memory[2 * page] == static_cast<std::uint8_t>(0x99), "the write-back clobbered the refreshed block");
+        counters = GuestBufferMemory::WrittenUploadCounters();
+        Require(counters[2] == before[2] + 2, "the third written upload did not refresh");
+        memory[7 * page] = 0x66;
+        AgcDriver::GuestMemory::BumpCollectEpoch();
+        {
+            GuestBufferMemory inflight(context);
+            inflight.AddWritable(address, bytes);
+            inflight.Upload(false);
+            GuestBufferMemory refused(context);
+            refused.AddWritable(address, bytes);
+            refused.Upload(false);
+            std::uint32_t adjustment = 0;
+            const auto descriptor = refused.Descriptor(address, bytes, adjustment);
+            Require(descriptor.buffer != VK_NULL_HANDLE && descriptor.buffer != cached, "an in-flight cached batch did not fall back to a fresh buffer");
+            recorder.Submit();
+            device.WaitQueue();
+            recorder.Sync();
+            inflight.WriteBack();
+            refused.WriteBack();
+        }
+        counters = GuestBufferMemory::WrittenUploadCounters();
+        Require(counters[7] == before[7] + 1, "an upload behind an in-flight batch was not refused the cached buffer");
+        Require(counters[0] == before[0] + 2, "the refused upload did not replace the cache entry");
+        {
+            GuestBufferMemory clean(context);
+            clean.AddWritable(address, bytes);
+            clean.Upload(false);
+            clean.WriteBack();
+        }
+        counters = GuestBufferMemory::WrittenUploadCounters();
+        Require(counters[1] >= before[1] + 1, "an unchanged written region was not served clean");
+        Require(memory[0] == 0x37 && memory[2 * page] == static_cast<std::uint8_t>(0x99) && memory[3 * page] == 0x55 && memory[5 * 65536] == 0x77 && memory[7 * page] == 0x66, "the guest content drifted across the written-cache uploads");
+        ClearUploadCopies(context.device);
+    }
+    return true;
+#else
+    return false;
+#endif
+}
+
 int main(int argc, char** argv) {
     _ZSt13set_terminatePFvvE_nid_postfix([] {
         std::fflush(nullptr);
@@ -16704,6 +16849,7 @@ int main(int argc, char** argv) {
         }
         Device& device = *created;
         if (argc == 2 && std::string_view(argv[1]) == "--host-import-lifetime-only") return RunHostImportLifetimeTests(device.GetContext());
+        if (argc == 2 && std::string_view(argv[1]) == "--written-upload-cache-only") return writtenUploadCacheTests(device) ? 0 : 77;
         if (argc == 2 && std::string_view(argv[1]) == "--host-import-mutation-race-only") return RunHostImportMutationRaceTests(device.GetContext());
         if (argc == 2 && (std::string_view(argv[1]) == "--gpu-timing-complete-only" || std::string_view(argv[1]) == "--gpu-timing-incomplete-only")) {
             return gpuTimingCompletionTests(device, std::string_view(argv[1]) == "--gpu-timing-incomplete-only");

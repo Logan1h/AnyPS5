@@ -3003,6 +3003,9 @@ struct UploadCopies {
         std::uint64_t generation = 0;
         Pieces pieces;
         std::list<Key>::iterator recent;
+        std::shared_ptr<const std::vector<std::byte>> snapshot;
+        std::uint64_t batch = 0;
+        std::uint64_t recorderId = 0;
     };
     std::map<Key, Entry> entries;
     std::list<Key> recency;
@@ -3108,6 +3111,75 @@ void forgetUploaded(const Context& context, std::uint64_t begin, std::size_t byt
         copies.bytes -= std::get<1>(found->first);
         copies.entries.erase(found);
     }
+}
+
+struct WrittenEntry {
+    std::shared_ptr<Buffer> buffer;
+    std::shared_ptr<const std::vector<std::byte>> snapshot;
+    std::uint64_t generation = 0;
+    std::uint64_t batch = 0;
+    std::uint64_t recorderId = 0;
+};
+
+std::atomic<std::uint64_t> deltaClean{0}, deltaRefreshed{0}, deltaRefreshBytes{0}, deltaRefreshBlocks{0}, deltaOverflow{0}, deltaRefusedRecorder{0}, deltaRefusedBatch{0}, deltaRefusedRun{0}, deltaInserted{0};
+
+bool findUploadedWritten(const Context& context, std::uint64_t begin, std::size_t bytes, VkBufferUsageFlags usage, WrittenEntry& out) {
+    if (uploadCacheBudget() == 0) return false;
+    auto& copies = UploadCopyCache();
+    const UploadCopies::Key key{begin, bytes, usage};
+    std::lock_guard lock(copies.mutex);
+    if (copies.device != context.device) return false;
+    const auto found = copies.entries.find(key);
+    if (found == copies.entries.end() || found->second.snapshot == nullptr) return false;
+    out.buffer = found->second.buffer;
+    out.snapshot = found->second.snapshot;
+    out.generation = found->second.generation;
+    out.batch = found->second.batch;
+    out.recorderId = found->second.recorderId;
+    copies.recency.splice(copies.recency.end(), copies.recency, found->second.recent);
+    return true;
+}
+
+void insertUploadedWritten(const Context& context, std::uint64_t begin, std::size_t bytes, VkBufferUsageFlags usage, const std::shared_ptr<Buffer>& buffer, std::shared_ptr<const std::vector<std::byte>> snapshot, std::uint64_t generation, std::uint64_t batch, std::uint64_t recorderId) {
+    const auto budget = uploadCacheBudget();
+    if (budget == 0 || generation == 0 || bytes > budget || snapshot == nullptr) return;
+    auto& copies = UploadCopyCache();
+    const UploadCopies::Key key{begin, bytes, usage};
+    std::lock_guard lock(copies.mutex);
+    if (copies.device != context.device) resetUploadCache(copies, context.device);
+    if (const auto found = copies.entries.find(key); found != copies.entries.end()) {
+        copies.recency.erase(found->second.recent);
+        copies.bytes -= std::get<1>(found->first);
+        copies.entries.erase(found);
+    }
+    while (!copies.recency.empty() && (copies.bytes + bytes > budget || copies.entries.size() >= uploadCacheEntries)) {
+        const auto oldest = copies.entries.find(copies.recency.front());
+        copies.bytes -= std::get<1>(oldest->first);
+        copies.entries.erase(oldest);
+        copies.recency.pop_front();
+    }
+    copies.recency.push_back(key);
+    UploadCopies::Entry entry;
+    entry.buffer = buffer;
+    entry.generation = generation;
+    entry.snapshot = std::move(snapshot);
+    entry.batch = batch;
+    entry.recorderId = recorderId;
+    entry.recent = std::prev(copies.recency.end());
+    copies.entries.emplace(key, std::move(entry));
+    copies.bytes += bytes;
+}
+
+void updateUploadedWritten(const Context& context, std::uint64_t begin, std::size_t bytes, VkBufferUsageFlags usage, std::shared_ptr<const std::vector<std::byte>> snapshot, std::uint64_t generation, std::uint64_t batch) {
+    auto& copies = UploadCopyCache();
+    const UploadCopies::Key key{begin, bytes, usage};
+    std::lock_guard lock(copies.mutex);
+    if (copies.device != context.device) return;
+    const auto found = copies.entries.find(key);
+    if (found == copies.entries.end() || found->second.snapshot == nullptr) return;
+    found->second.snapshot = std::move(snapshot);
+    found->second.generation = generation;
+    found->second.batch = batch;
 }
 
 bool mirrorsEnabled() {
@@ -6861,7 +6933,7 @@ void GuestBufferMemory::UploadFinish(bool addressable, std::optional<std::pair<s
     const auto uploads = uploadsProfiled.fetch_add(1, std::memory_order_relaxed) + 1;
     if (uploads % 2000 == 0) {
         const auto& copies = Copies();
-        AgcDriver::ProfilePrint_nid_no_patch("[buffers] %llu uploads: import lookup %.0f ms, buffer allocation %.0f ms, guest read %.0f ms; copies on the GPU: %llu regions (%.0f KiB) copied out of imports, %llu written sub-ranges (%.0f KiB) copied back, %llu staging stores by the CPU at write-back\n", static_cast<unsigned long long>(uploads), importUs.load(std::memory_order_relaxed) / 1000.0, allocateUs.load(std::memory_order_relaxed) / 1000.0, readUs.load(std::memory_order_relaxed) / 1000.0, static_cast<unsigned long long>(copies.gpuCopies.load(std::memory_order_relaxed)), copies.gpuCopyBytes.load(std::memory_order_relaxed) / 1024.0, static_cast<unsigned long long>(copies.gpuCopyBacks.load(std::memory_order_relaxed)), copies.gpuCopyBackBytes.load(std::memory_order_relaxed) / 1024.0, static_cast<unsigned long long>(copies.stagingStores.load(std::memory_order_relaxed)));
+        AgcDriver::ProfilePrint_nid_no_patch("[buffers] %llu uploads: import lookup %.0f ms, buffer allocation %.0f ms, guest read %.0f ms; copies on the GPU: %llu regions (%.0f KiB) copied out of imports, %llu written sub-ranges (%.0f KiB) copied back, %llu staging stores by the CPU at write-back; written-cache: %llu inserted, %llu clean, %llu refreshed (%.0f MiB, %llu blocks), %llu overflow, refused (recorder %llu, batch %llu, run %llu)\n", static_cast<unsigned long long>(uploads), importUs.load(std::memory_order_relaxed) / 1000.0, allocateUs.load(std::memory_order_relaxed) / 1000.0, readUs.load(std::memory_order_relaxed) / 1000.0, static_cast<unsigned long long>(copies.gpuCopies.load(std::memory_order_relaxed)), copies.gpuCopyBytes.load(std::memory_order_relaxed) / 1024.0, static_cast<unsigned long long>(copies.gpuCopyBacks.load(std::memory_order_relaxed)), copies.gpuCopyBackBytes.load(std::memory_order_relaxed) / 1024.0, static_cast<unsigned long long>(copies.stagingStores.load(std::memory_order_relaxed)), static_cast<unsigned long long>(deltaInserted.load(std::memory_order_relaxed)), static_cast<unsigned long long>(deltaClean.load(std::memory_order_relaxed)), static_cast<unsigned long long>(deltaRefreshed.load(std::memory_order_relaxed)), deltaRefreshBytes.load(std::memory_order_relaxed) / 1048576.0, static_cast<unsigned long long>(deltaRefreshBlocks.load(std::memory_order_relaxed)), static_cast<unsigned long long>(deltaOverflow.load(std::memory_order_relaxed)), static_cast<unsigned long long>(deltaRefusedRecorder.load(std::memory_order_relaxed)), static_cast<unsigned long long>(deltaRefusedBatch.load(std::memory_order_relaxed)), static_cast<unsigned long long>(deltaRefusedRun.load(std::memory_order_relaxed)));
     }
     const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
     if (ms > 50) {
@@ -6882,6 +6954,79 @@ void GuestBufferMemory::UploadFinish(bool addressable, std::optional<std::pair<s
             if (region.buffer != nullptr && region.end - region.begin >= (1u << 20u)) std::fprintf(stderr, "[bigbuf] upload 0x%llx+0x%llx writable=%d hostBacked=%d sparse=%d addressable=%d\n", static_cast<unsigned long long>(region.begin), static_cast<unsigned long long>(region.end - region.begin), region.writable ? 1 : 0, region.hostBacked ? 1 : 0, region.sparse ? 1 : 0, addressable ? 1 : 0);
         }
     }
+}
+
+bool GuestBufferMemory::refreshWrittenUpload(Region& region, std::uint64_t bytes, VkBufferUsageFlags usage) {
+    auto* recorder = Recorder::Active();
+    if (recorder == nullptr) return false;
+    WrittenEntry entry;
+    if (!findUploadedWritten(context, region.begin, static_cast<std::size_t>(bytes), usage, entry)) return false;
+    if (entry.recorderId != recorder->Id()) {
+        deltaRefusedRecorder.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    if (recorder->CompletedThrough() < entry.batch) {
+        deltaRefusedBatch.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    if (recorder->RunOpen()) {
+        deltaRefusedRun.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> dirty;
+    const auto generation = GuestMemory::CollectWrittenBlocks(region.begin, static_cast<std::size_t>(bytes), entry.generation, dirty);
+    if (generation == 0) return false;
+    std::uint64_t dirtyBytes = 0;
+    for (const auto& [dirtyBegin, dirtyEnd] : dirty) dirtyBytes += dirtyEnd - dirtyBegin;
+    if (dirtyBytes > bytes / 4) {
+        deltaOverflow.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    if (dirty.empty()) {
+        region.buffer = entry.buffer;
+        region.uploadedShared = entry.snapshot;
+        region.snapshot.clear();
+        deltaClean.fetch_add(1, std::memory_order_relaxed);
+        return true;
+    }
+    auto snapshot = std::make_shared<std::vector<std::byte>>(*entry.snapshot);
+    {
+        const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::BufferUpload);
+        for (const auto& [dirtyBegin, dirtyEnd] : dirty) {
+            GuestMemory::Read(dirtyBegin, std::span<std::byte>(snapshot->data() + static_cast<std::size_t>(dirtyBegin - region.begin), static_cast<std::size_t>(dirtyEnd - dirtyBegin)));
+        }
+    }
+    {
+        const auto commands = recorder->Commands();
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_INDEX_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        if (dirty.size() == 1 && dirtyBytes <= (64ull << 10u)) {
+            const auto [dirtyBegin, dirtyEnd] = dirty.front();
+            const auto update = context.Function<PFN_vkCmdUpdateBuffer>("vkCmdUpdateBuffer");
+            update(commands, entry.buffer->Handle(), static_cast<VkDeviceSize>(dirtyBegin - region.begin), static_cast<VkDeviceSize>(dirtyEnd - dirtyBegin), snapshot->data() + (dirtyBegin - region.begin));
+        } else {
+            auto slice = recorder->DrawUpload(static_cast<std::size_t>(dirtyBytes));
+            std::vector<VkBufferCopy> copies;
+            copies.reserve(dirty.size());
+            std::size_t packed = 0;
+            for (const auto& [dirtyBegin, dirtyEnd] : dirty) {
+                const auto length = static_cast<std::size_t>(dirtyEnd - dirtyBegin);
+                std::memcpy(slice.bytes + packed, snapshot->data() + (dirtyBegin - region.begin), length);
+                copies.push_back({slice.offset + packed, static_cast<VkDeviceSize>(dirtyBegin - region.begin), static_cast<VkDeviceSize>(length)});
+                packed += length;
+            }
+            const auto copy = context.Resolved(&DeviceFunctions::cmdCopyBuffer, "vkCmdCopyBuffer");
+            copy(commands, slice.buffer->Handle(), entry.buffer->Handle(), static_cast<std::uint32_t>(copies.size()), copies.data());
+        }
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_UNIFORM_READ_BIT | VK_ACCESS_VERTEX_ATTRIBUTE_READ_BIT | VK_ACCESS_INDEX_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+    }
+    region.buffer = entry.buffer;
+    region.uploadedShared = std::move(snapshot);
+    region.snapshot.clear();
+    updateUploadedWritten(context, region.begin, static_cast<std::size_t>(bytes), usage, region.uploadedShared, generation, recorder->Submissions() + 1);
+    deltaRefreshed.fetch_add(1, std::memory_order_relaxed);
+    deltaRefreshBytes.fetch_add(bytes, std::memory_order_relaxed);
+    deltaRefreshBlocks.fetch_add(dirty.size(), std::memory_order_relaxed);
+    return true;
 }
 
 void GuestBufferMemory::copyRegion(Region& region, bool addressable) {
@@ -6937,6 +7082,25 @@ void GuestBufferMemory::copyRegion(Region& region, bool addressable) {
         }
         uploadGeneration = collectUploadWrites(region.begin, region.sparse, region.backed, static_cast<std::size_t>(allocated));
     } else if (written) {
+        const auto cacheUsage = usage | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+        if (!region.sparse && region.bufferEnd == 0 && refreshWrittenUpload(region, allocated, cacheUsage)) return;
+        if (!region.sparse && region.bufferEnd == 0 && region.buffer == nullptr) {
+            if (auto* recorder = Recorder::Active(); recorder != nullptr) {
+                if (const auto generation = collectUploadWrites(region.begin, false, region.backed, static_cast<std::size_t>(allocated)); generation != 0) {
+                    region.buffer = std::make_shared<Buffer>(context, static_cast<std::size_t>(allocated), cacheUsage);
+                    const GuestMemory::ReadSiteScope readSite(GuestMemory::ReadSite::BufferUpload);
+                    GuestMemory::Read(region.begin, region.buffer->Bytes());
+                    readBytes += region.buffer->Bytes().size();
+                    region.uploaded.assign(region.buffer->Bytes().begin(), region.buffer->Bytes().end());
+                    if (uploadUnchanged(region.begin, false, region.backed, static_cast<std::size_t>(allocated), generation)) {
+                        insertUploadedWritten(context, region.begin, static_cast<std::size_t>(allocated), cacheUsage, region.buffer, std::make_shared<std::vector<std::byte>>(region.uploaded), generation, recorder->Submissions() + 1, recorder->Id());
+                        deltaInserted.fetch_add(1, std::memory_order_relaxed);
+                    }
+                    region.snapshot.clear();
+                    return;
+                }
+            }
+        }
         forgetUploaded(context, region.begin, static_cast<std::size_t>(allocated), usage);
     }
     // A buffer made by UploadPrepare for a GPU copy that fell back here (its import went) is kept.
@@ -7071,6 +7235,10 @@ std::shared_ptr<Buffer> takeCarriedShadow(const Context& context, const Recorder
 
 std::uint64_t GuestBufferMemory::CarriedShadowCopies() {
     return carriedShadowCopies.load(std::memory_order_relaxed);
+}
+
+std::array<std::uint64_t, 9> GuestBufferMemory::WrittenUploadCounters() {
+    return {deltaInserted.load(std::memory_order_relaxed), deltaClean.load(std::memory_order_relaxed), deltaRefreshed.load(std::memory_order_relaxed), deltaRefreshBytes.load(std::memory_order_relaxed), deltaRefreshBlocks.load(std::memory_order_relaxed), deltaOverflow.load(std::memory_order_relaxed), deltaRefusedRecorder.load(std::memory_order_relaxed), deltaRefusedBatch.load(std::memory_order_relaxed), deltaRefusedRun.load(std::memory_order_relaxed)};
 }
 
 void GuestBufferMemory::NoteCarriedShadows(const Recorder& recorder) const {
@@ -7803,7 +7971,8 @@ void GuestBufferMemory::WriteBack() {
         if (!region.sparse) {
             const auto first = static_cast<std::size_t>(begin - region.begin);
             const auto length = static_cast<std::size_t>(end - begin);
-            storeChanged(begin, region.buffer->Bytes().subspan(first, length), std::span<const std::byte>(region.uploaded).subspan(first, length), GuestMemory::WriteChangedKeepingGuest);
+            const auto baseline = region.uploadedShared != nullptr ? std::span<const std::byte>(*region.uploadedShared) : std::span<const std::byte>(region.uploaded);
+            storeChanged(begin, region.buffer->Bytes().subspan(first, length), baseline.subspan(first, length), GuestMemory::WriteChangedKeepingGuest);
             continue;
         }
         std::size_t packed = 0;

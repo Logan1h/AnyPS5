@@ -439,6 +439,9 @@ public:
     void MarkStagedWrites() const;
     void NoteCarriedShadows(const Recorder& recorder) const;
     static std::uint64_t CarriedShadowCopies();
+    // inserted, clean, refreshed, refreshed bytes, refreshed ranges, overflow, refused by recorder,
+    // refused by an in-flight batch, refused with an open run (the written-upload cache, for tests).
+    static std::array<std::uint64_t, 9> WrittenUploadCounters();
     // Whether registered allocations are pinned until write-back (address-based shaders): by this
     // build's own lease, or by the cached address space it holds.
     bool HoldsLease() const { return !lease.empty() || space != nullptr; }
@@ -493,6 +496,9 @@ private:
         std::shared_ptr<Buffer> buffer;
         // Guest bytes as uploaded; write-back only stores bytes the GPU changed.
         std::vector<std::byte> uploaded {};
+        // Set when the buffer came from the written-region upload cache: the write-back diff baseline,
+        // shared with the cache entry so a refresh copies no whole-region snapshot.
+        std::shared_ptr<const std::vector<std::byte>> uploadedShared {};
         // Registered allocation that is imported: its bytes are read from live guest memory, not a snapshot.
         bool hostBacked = false;
         // Set when the region is served by an imported allocation; nothing is copied or written back.
@@ -575,6 +581,9 @@ private:
     // Gives a region a buffer of its own with its bytes (guest memory for host-backed and writable
     // ranges, plus the write-back's reference copy for a range a descriptor writes; else its snapshot).
     void copyRegion(Region& region, bool addressable);
+    // Serves a written region from the written-upload cache when the cached buffer can be patched in
+    // stream by the blocks the CPU stored since the entry's generation; false selects the full path.
+    bool refreshWrittenUpload(Region& region, std::uint64_t bytes, VkBufferUsageFlags usage);
     // Whether a region inside a host import that cannot be bound in place is copied by the GPU
     // instead of the CPU (see Region::gpuCopy): live guest bytes, not sparse, at most the size
     // APS5_GPU_COPY_MAX_KIB allows, and APS5_CPU_COPIES unset.
